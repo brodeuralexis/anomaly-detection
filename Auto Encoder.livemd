@@ -1,0 +1,176 @@
+# Auto Encoder
+
+## Dependencies
+
+```elixir
+Mix.install([
+  {:exla, "~> 0.1.0-dev", github: "elixir-nx/nx", sparse: "exla", override: true},
+  {:nx, "~> 0.1.0-dev", github: "elixir-nx/nx", sparse: "nx", override: true},
+  {:axon, "~> 0.1.0-dev", github: "elixir-nx/axon"},
+  {:scholar, "~> 0.1.0", github: "elixir-nx/scholar", branch: "main"},
+  {:explorer, "~> 0.1.0-dev", github: "elixir-nx/explorer", branch: "main"},
+  {:vega_lite, "~> 0.1.3"},
+  {:kino, "~> 0.5.2"}
+])
+```
+
+```elixir
+alias Explorer.DataFrame
+alias Explorer.Series
+alias VegaLite, as: Vl
+```
+
+## Data Set
+
+```elixir
+df = DataFrame.read_csv!("KDD.csv")
+```
+
+```elixir
+{n_rows, n_cols} = DataFrame.shape(df)
+
+split = trunc(n_rows * 0.8)
+n_train_rows = split
+n_test_rows = n_rows - split
+
+train_df = DataFrame.slice(df, 0, n_train_rows)
+test_df = DataFrame.slice(df, split, n_test_rows)
+
+normal_train_df =
+  train_df
+  |> DataFrame.filter(Series.equal(train_df["anomalous"], 0))
+  |> DataFrame.select(["anomalous"], :drop)
+
+anomalous_train_df =
+  train_df
+  |> DataFrame.filter(Series.equal(train_df["anomalous"], 1))
+  |> DataFrame.select(["anomalous"], :drop)
+
+normal_test_df =
+  test_df
+  |> DataFrame.filter(Series.equal(test_df["anomalous"], 0))
+  |> DataFrame.select(["anomalous"], :drop)
+
+anomalous_test_df =
+  test_df
+  |> DataFrame.filter(Series.equal(test_df["anomalous"], 1))
+  |> DataFrame.select(["anomalous"], :drop)
+
+train_x = DataFrame.select(train_df, ["anomalous"], :drop)
+train_y = DataFrame.select(train_df, ["anomalous"], :keep)
+
+test_x = DataFrame.select(test_df, ["anomalous"], :drop)
+test_y = DataFrame.select(test_df, ["anomalous"], :keep)
+
+{_, n_features} = DataFrame.shape(train_x)
+{_, n_labels} = DataFrame.shape(train_y)
+
+:ok
+```
+
+```elixir
+to_tensor = fn df ->
+  Nx.Defn.jit(
+    fn ->
+      df
+      |> DataFrame.names()
+      |> Enum.map(fn name ->
+        df[name]
+        |> Series.to_tensor(type: {:f, 64})
+        |> Nx.reshape({:auto, 1})
+      end)
+      |> Nx.concatenate(axis: 1)
+    end,
+    [],
+    compiler: EXLA
+  )
+end
+
+train_x = to_tensor.(train_x)
+train_y = to_tensor.(train_y)
+test_x = to_tensor.(test_x)
+test_y = to_tensor.(test_y)
+
+normal_train_x = to_tensor.(normal_train_df)
+anomalous_train_x = to_tensor.(anomalous_train_df)
+normal_test_x = to_tensor.(normal_test_df)
+anomalous_test_x = to_tensor.(anomalous_test_df)
+
+:ok
+```
+
+```elixir
+batched_normal_train_x = Nx.to_batched_list(normal_train_x, 32)
+:ok
+```
+
+## Model
+
+```elixir
+model =
+  Axon.input({nil, n_features})
+  |> Axon.dense(100, activation: :relu)
+  |> Axon.batch_norm()
+  |> Axon.dense(50, activation: :relu)
+  |> Axon.batch_norm()
+  |> Axon.dense(10, activation: :sigmoid)
+  |> Axon.batch_norm()
+  |> Axon.dense(50, activation: :relu)
+  |> Axon.batch_norm()
+  |> Axon.dense(100, activation: :relu)
+  |> Axon.batch_norm()
+  |> Axon.dense(n_features, activation: :relu)
+```
+
+## Training
+
+```elixir
+params =
+  model
+  |> Axon.Loop.trainer(:mean_squared_error, :adam)
+  |> Axon.Loop.metric(:mean_absolute_error, "Mean Absolute Error")
+  |> Axon.Loop.run(Stream.zip(batched_normal_train_x, batched_normal_train_x),
+    epochs: 25,
+    compiler: EXLA
+  )
+```
+
+## Prediction
+
+```elixir
+require Axon
+
+Enum.each([0.2, 0.4, 0.6, 0.8, 1], fn threshold ->
+  normal_test_pred = Axon.predict(model, params, normal_test_x, compiler: EXLA)
+  anomalous_test_pred = Axon.predict(model, params, anomalous_test_x, compiler: EXLA)
+
+  normal_test_precision =
+    Nx.Defn.jit(&Axon.Losses.mean_squared_error/2, [normal_test_x, normal_test_pred],
+      compiler: EXLA
+    )
+
+  anomalous_test_precision =
+    Nx.Defn.jit(&Axon.Losses.mean_squared_error/2, [anomalous_test_x, anomalous_test_pred],
+      compiler: EXLA
+    )
+
+  normal_test_precision =
+    normal_test_precision
+    |> Nx.greater(threshold)
+    |> Nx.sum()
+    |> Nx.divide(Nx.axis_size(normal_test_precision, 0))
+
+  anomalous_test_precision =
+    anomalous_test_precision
+    |> Nx.greater(threshold)
+    |> Nx.sum()
+    |> Nx.divide(Nx.axis_size(anomalous_test_precision, 0))
+
+  IO.puts("Threshold: #{threshold}")
+  IO.puts("fp,tp")
+
+  IO.puts(
+    "#{normal_test_precision |> Nx.to_number()}, #{anomalous_test_precision |> Nx.to_number()}"
+  )
+end)
+```

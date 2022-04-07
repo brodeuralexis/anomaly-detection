@@ -1,0 +1,280 @@
+# Generative Adversarial Network
+
+## Dependencies
+
+```elixir
+Mix.install([
+  {:exla, "~> 0.1.0-dev", github: "elixir-nx/nx", sparse: "exla", override: true},
+  {:nx, "~> 0.1.0-dev", github: "elixir-nx/nx", sparse: "nx", override: true},
+  {:axon, "~> 0.1.0-dev", github: "elixir-nx/axon"},
+  {:scholar, "~> 0.1.0", github: "elixir-nx/scholar", branch: "main"},
+  {:explorer, "~> 0.1.0-dev", github: "elixir-nx/explorer", branch: "main"},
+  {:vega_lite, "~> 0.1.3"},
+  {:kino, "~> 0.5.2"}
+])
+```
+
+```elixir
+alias Explorer.DataFrame
+alias Explorer.Series
+alias VegaLite, as: Vl
+```
+
+## Data Set
+
+```elixir
+df = DataFrame.read_csv!("KDD.csv")
+```
+
+```elixir
+{n_rows, n_cols} = DataFrame.shape(df)
+
+split = trunc(n_rows * 0.8)
+n_train_rows = split
+n_test_rows = n_rows - split
+
+train_df = DataFrame.slice(df, 0, n_train_rows)
+test_df = DataFrame.slice(df, split, n_test_rows)
+
+normal_train_df =
+  train_df
+  |> DataFrame.filter(Series.equal(train_df["anomalous"], 0))
+  |> DataFrame.select(["anomalous"], :drop)
+
+anomalous_train_df =
+  train_df
+  |> DataFrame.filter(Series.equal(train_df["anomalous"], 1))
+  |> DataFrame.select(["anomalous"], :drop)
+
+normal_test_df =
+  test_df
+  |> DataFrame.filter(Series.equal(test_df["anomalous"], 0))
+  |> DataFrame.select(["anomalous"], :drop)
+
+anomalous_test_df =
+  test_df
+  |> DataFrame.filter(Series.equal(test_df["anomalous"], 1))
+  |> DataFrame.select(["anomalous"], :drop)
+
+train_x = DataFrame.select(train_df, ["anomalous"], :drop)
+train_y = DataFrame.select(train_df, ["anomalous"], :keep)
+
+test_x = DataFrame.select(test_df, ["anomalous"], :drop)
+test_y = DataFrame.select(test_df, ["anomalous"], :keep)
+
+{_, n_features} = DataFrame.shape(train_x)
+{_, n_labels} = DataFrame.shape(train_y)
+
+:ok
+```
+
+```elixir
+to_tensor = fn df ->
+  Nx.Defn.jit(
+    fn ->
+      df
+      |> DataFrame.names()
+      |> Enum.map(fn name ->
+        df[name]
+        |> Series.to_tensor(type: {:f, 64})
+        |> Nx.reshape({:auto, 1})
+      end)
+      |> Nx.concatenate(axis: 1)
+    end,
+    [],
+    compiler: EXLA
+  )
+end
+
+train_x = to_tensor.(train_x)
+train_y = to_tensor.(train_y)
+test_x = to_tensor.(test_x)
+test_y = to_tensor.(test_y)
+
+normal_train_x = to_tensor.(normal_train_df)
+anomalous_train_x = to_tensor.(anomalous_train_df)
+normal_test_x = to_tensor.(normal_test_df)
+anomalous_test_x = to_tensor.(anomalous_test_df)
+
+:ok
+```
+
+## Model
+
+```elixir
+n_latent = 10
+
+g_model =
+  Axon.input({nil, n_latent})
+  |> Axon.dense(55, activation: :relu)
+  |> Axon.batch_norm()
+  |> Axon.dense(n_features, activation: :relu)
+
+d_model =
+  Axon.input({nil, n_features})
+  |> Axon.dense(64, activation: :relu)
+  |> Axon.batch_norm()
+  |> Axon.dense(32, activation: :relu)
+  |> Axon.dropout(rate: 0.2)
+  |> Axon.dense(1, activation: :sigmoid)
+
+:ok
+```
+
+## Training
+
+```elixir
+require Axon
+
+batch_size = 32
+steps = 5
+
+{init_optim_d, optim_d} = Axon.Optimizers.sgd(0.003)
+{init_optim_g, optim_g} = Axon.Optimizers.sgd(0.003)
+
+running_average = fn avg, obs, i ->
+  avg
+  |> Nx.multiply(i)
+  |> Nx.add(obs)
+  |> Nx.divide(Nx.add(i, 1))
+end
+
+init = fn ->
+  d_params = Axon.init(d_model)
+  g_params = Axon.init(g_model)
+
+  %{
+    iteration: Nx.tensor(0),
+    discriminator: %{
+      model_state: d_params,
+      optimizer_state: init_optim_d.(d_params),
+      loss: Nx.tensor(0)
+    },
+    generator: %{
+      model_state: g_params,
+      optimizer_state: init_optim_g.(g_params),
+      loss: Nx.tensor(0)
+    }
+  }
+end
+
+step = fn {real_features, real_labels}, state ->
+  iter = state[:iteration]
+  d_params = state[:discriminator][:model_state]
+  g_params = state[:generator][:model_state]
+
+  d_optimizer_state = state[:discriminator][:optimizer_state]
+  d_loss = state[:discriminator][:loss]
+
+  {d_params, d_optimizer_state, d_loss} =
+    Enum.reduce(0..steps, {d_params, d_optimizer_state, d_loss}, fn
+      _, {d_params, d_optimizer_state, _d_loss} ->
+        # Tensor of 64 by 1 of 0s.
+        fake_labels = Nx.iota({batch_size, 1}) |> Nx.equal(-1)
+        noise = Nx.random_uniform({batch_size, n_latent})
+
+        {d_loss, d_grads} =
+          Nx.Defn.value_and_grad(d_params, fn d_params ->
+            fake_features = Axon.predict(g_model, g_params, noise)
+
+            d_fake_pred = Axon.predict(d_model, d_params, fake_features)
+            d_real_pred = Axon.predict(d_model, d_params, real_features)
+
+            joint_pred = Nx.concatenate([d_fake_pred, d_real_pred], axis: 0)
+            joint_labels = Nx.concatenate([fake_labels, real_labels], axis: 0)
+
+            Axon.Losses.mean_squared_error(joint_labels, joint_pred, reduction: :mean)
+          end)
+
+        {d_updates, d_optimizer_state} = optim_d.(d_grads, d_optimizer_state, d_params)
+        d_params = Axon.Updates.apply_updates(d_params, d_updates)
+
+        {d_params, d_optimizer_state, d_loss}
+    end)
+
+  {g_loss, g_grads} =
+    Nx.Defn.value_and_grad(g_params, fn g_params ->
+      # Tensor of 64 by 1 of 0s.
+      fake_labels = Nx.iota({batch_size, 1}) |> Nx.equal(-1)
+      noise = Nx.random_uniform({batch_size, n_latent})
+      fake_features = Axon.predict(g_model, g_params, noise)
+
+      d_preds = Axon.predict(d_model, d_params, fake_features)
+
+      Axon.Losses.mean_squared_error(fake_labels, d_preds, reduction: :mean)
+    end)
+
+  g_optimizer_state = state[:generator][:optimizer_state]
+
+  {g_updates, g_optimizer_state} = optim_g.(g_grads, g_optimizer_state, g_params)
+  g_params = Axon.Updates.apply_updates(g_params, g_updates)
+
+  %{
+    iteration: Nx.add(iter, 1),
+    discriminator: %{
+      model_state: d_params,
+      optimizer_state: d_optimizer_state,
+      loss: running_average.(state[:discriminator][:loss], d_loss, iter)
+    },
+    generator: %{
+      model_state: g_params,
+      optimizer_state: g_optimizer_state,
+      loss: running_average.(state[:generator][:loss], g_loss, iter)
+    }
+  }
+end
+
+:ok
+```
+
+```elixir
+batched_train_x = Nx.to_batched_list(train_x, batch_size)
+batched_train_y = Nx.to_batched_list(train_y, batch_size)
+
+state =
+  Axon.Loop.loop(step, init)
+  |> Axon.Loop.log(:iteration_completed, fn state ->
+    %Axon.Loop.State{epoch: epoch, iteration: iter, step_state: pstate} = state
+
+    g_loss = "G: #{:io_lib.format('~.5f', [Nx.to_number(pstate[:generator][:loss])])}"
+    d_loss = "D: #{:io_lib.format('~.5f', [Nx.to_number(pstate[:discriminator][:loss])])}"
+
+    "\rEpoch: #{Nx.to_number(epoch)}, batch: #{Nx.to_number(iter)} #{g_loss}, #{d_loss}"
+  end)
+  |> Axon.Loop.log(:epoch_completed, fn state ->
+    %Axon.Loop.State{step_state: pstate} = state
+
+    File.write!(
+      "GAN.etf",
+      :erlang.term_to_binary({
+        pstate[:generator][:model_state],
+        pstate[:discriminator][:model_state]
+      })
+    )
+
+    "\n"
+  end)
+  |> Axon.Loop.run(Stream.zip(batched_train_x, batched_train_y), epochs: 25, compiler: EXLA)
+
+:ok
+```
+
+## Predictions
+
+```elixir
+require Axon
+
+%Axon.Loop.State{step_state: pstate} = state
+
+pred =
+  Axon.predict(d_model, pstate[:discriminator][:model_state], test_x |> Nx.add(0.000005),
+    compiler: EXLA
+  )
+
+accuracy = Scholar.Metrics.accuracy(test_y, pred)
+precision = Scholar.Metrics.precision(test_y, pred)
+
+IO.puts("#{Nx.to_number(accuracy)}, #{Nx.to_number(precision)}")
+
+:ok
+```
